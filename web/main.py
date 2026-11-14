@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +24,19 @@ from web.api import ROUTERS
 
 WEB = Path(__file__).resolve().parent
 
-app = FastAPI(title="ETF 轮动")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时准备数据；网络失败不阻塞页面，首个接口请求会再次尝试补齐。"""
+    try:
+        await core.ensure_initial_data()
+        await core.ensure_index()
+    except Exception as exc:
+        print(f"行情数据启动预热失败，将由接口按需重试: {type(exc).__name__}: {exc}")
+    yield
+
+
+app = FastAPI(title="ETF 轮动", lifespan=lifespan)
 
 for router in ROUTERS:
     app.include_router(router, prefix="/api")

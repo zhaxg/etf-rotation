@@ -24,6 +24,31 @@ const momCls = (x) => x > 0 ? "up" : x < 0 ? "down" : "";
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+async function requestJson(url, options = {}) {
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (err) {
+    throw new Error("网络连接失败，请稍后重试");
+  }
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await res.text().catch(() => "");
+    const message = text.trim().startsWith("{")
+      ? (JSON.parse(text).detail || text)
+      : `接口返回异常 (${res.status})`;
+    throw new Error(message || `请求失败 (${res.status})`);
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error("接口返回的数据不是有效 JSON");
+  }
+  if (!res.ok) throw new Error(data.detail || `请求失败 (${res.status})`);
+  return data;
+}
+
 function fmtAmount(x) {
   if (!isFinite(x) || x <= 0) return "—";
   if (x >= 1e8) return (x / 1e8).toFixed(2) + "亿";
@@ -200,8 +225,9 @@ window.addEventListener("hashchange", () =>
 /* ───────── 备选池 ───────── */
 
 async function fetchInstruments() {
-  const res = await fetch("/api/instruments");
-  state.instruments = await res.json();
+  const data = await requestJson("/api/instruments");
+  if (!Array.isArray(data)) throw new Error("接口返回的数据格式不正确");
+  state.instruments = data;
   renderPool();
   // 直接以 #strategy 打开时, 等池数据到位再测算一次
   if ($("#panel-strategy").classList.contains("is-active") && !state.strategy) runStrategy();
@@ -336,13 +362,11 @@ async function runStrategy() {
   const box = $("#target-list");
   box.innerHTML = `<p class="muted">测算中…</p>`;
   try {
-    const res = await fetch("/api/strategy", {
+    const data = await requestJson("/api/strategy", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pool: state.instruments.map((x) => ({ code: x.code })) }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "计算失败");
     const keep = state.strategy && state.strategy.active;
     if (keep && data.strategies[keep]) data.active = keep;   // 保留 seg 切换
     state.strategy = data;

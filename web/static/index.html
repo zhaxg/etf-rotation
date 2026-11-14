@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- 微信内置浏览器按 100% 渲染; 其他浏览器统一缩到 80%, 消除两端观感差异 -->
+<!-- 移动端非微信浏览器缩到 80%; 微信内置浏览器和桌面端保持 100% 渲染 -->
 <script>
   (function () {
     var ua = navigator.userAgent || "";
-    if (!/micromessenger/i.test(ua)) {
+    var isMobile = /Android|iPhone|iPad|iPod|Mobile|IEMobile|Opera Mini/i.test(ua);
+    var isWeChat = /micromessenger/i.test(ua);
+    if (isMobile && !isWeChat) {
       document.documentElement.style.zoom = "0.8";
     }
   })();
@@ -24,7 +26,7 @@
 <header class="top">
   <div class="top-inner">
     <div class="brand">
-      <h1>山海双策</h1>
+    <img src="app.png?v=20261114a" alt="山海双策">
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab is-active" data-tab="pool" role="tab">备选池</button>

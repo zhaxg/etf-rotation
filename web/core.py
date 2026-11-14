@@ -29,6 +29,7 @@ import pandas as pd
 
 import engine as E
 from pipeline import build_tr
+from pipeline.fetch_raw import ensure_data
 from strategies import STRATEGIES, fresh_target
 from universe import DEFAULT_CODES, WEB_POOL
 
@@ -83,6 +84,31 @@ def _load_pool() -> list[str]:
 
 
 POOL_CODES: list[str] = _load_pool()
+INITIALIZING_DATA: bool = False
+
+
+async def ensure_initial_data() -> None:
+    """首次启动自动补齐本地日线 / XDXR / TR 数据；已有文件不会被重复拉取。"""
+    global INITIALIZING_DATA
+    required = [code for code in POOL_CODES
+                if not (DATA / f"{code}_raw.csv").exists()
+                or not (DATA / f"{code}.csv").exists()]
+    if not required:
+        return
+    if INITIALIZING_DATA:
+        raise HTTPException(503, "行情数据正在初始化，请稍后刷新")
+    INITIALIZING_DATA = True
+    try:
+        ok = await ensure_data(codes=POOL_CODES, required=required)
+    except Exception as exc:
+        raise HTTPException(503, f"行情数据初始化失败：{type(exc).__name__}") from exc
+    finally:
+        INITIALIZING_DATA = False
+    if not ok:
+        missing = [code for code in required
+                   if not (DATA / f"{code}_raw.csv").exists()
+                   or not (DATA / f"{code}.csv").exists()]
+        raise HTTPException(503, f"行情数据初始化失败，缺少：{', '.join(missing)}")
 
 
 # ---------------------------------------------------------------- 当日行情 (分时/成交额)
@@ -666,26 +692,34 @@ async def run_strategy(pool: list[dict], defense: bool = False, live: bool | Non
 
 async def build_instruments() -> list[dict]:
     """标的目录: 现价 / 涨跌幅 / 成交额 / 分时路径 + 52周新高 / RAM / 120日动量。"""
+    await ensure_initial_data()
+    missing = [code for code in POOL_CODES
+               if not (DATA / f"{code}_raw.csv").exists()]
+    if missing:
+        raise HTTPException(503, f"行情数据初始化失败，缺少：{', '.join(missing)}")
     maybe_refresh_data()
     quotes = await load_quotes()
     out = []
     for code in POOL_CODES:
-        raw = pd.read_csv(DATA / f"{code}_raw.csv", parse_dates=["date"]).set_index("date")
-        st = code_stats(code)
-        q = quotes.get(code) or _fallback_quote(code)
-        out.append({
-            "code": code, "name": NAMES.get(code, code),
-            "category": CATEGORY.get(code, ""),
-            "price": round(q["price"], 4),
-            "change_pct": round(q["change_pct"], 4),
-            "amount": q["amount"],
-            "spark": q["spark"],
-            "pre": q.get("pre", 0.0),
-            "day": q.get("day", ""),
-            "first": raw.index[0].date().isoformat(),
-            "last": raw.index[-1].date().isoformat(),
-            "high52": num(st["high52"]), "ram30": num(st["ram30"]),
-            "mom120": num(st["mom120"]),
-            "link": futunn_link(code),
-        })
+        try:
+            raw = pd.read_csv(DATA / f"{code}_raw.csv", parse_dates=["date"]).set_index("date")
+            st = code_stats(code)
+            q = quotes.get(code) or _fallback_quote(code)
+            out.append({
+                "code": code, "name": NAMES.get(code, code),
+                "category": CATEGORY.get(code, ""),
+                "price": round(q["price"], 4),
+                "change_pct": round(q["change_pct"], 4),
+                "amount": q["amount"],
+                "spark": q["spark"],
+                "pre": q.get("pre", 0.0),
+                "day": q.get("day", ""),
+                "first": raw.index[0].date().isoformat(),
+                "last": raw.index[-1].date().isoformat(),
+                "high52": num(st["high52"]), "ram30": num(st["ram30"]),
+                "mom120": num(st["mom120"]),
+                "link": futunn_link(code),
+            })
+        except Exception as exc:
+            raise HTTPException(503, f"{NAMES.get(code, code)} 数据读取失败：{type(exc).__name__}") from exc
     return out
