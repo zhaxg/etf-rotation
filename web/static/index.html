@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 微信内置浏览器按 100% 渲染; 其他浏览器统一缩到 80%, 消除两端观感差异 -->
+<script>
+  (function () {
+    var ua = navigator.userAgent || "";
+    if (!/micromessenger/i.test(ua)) {
+      document.documentElement.style.zoom = "0.8";
+    }
+  })();
+</script>
+<meta name="color-scheme" content="light dark">
+<title>山海双策</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg?v=20261114v">
+<link rel="icon" href="favicon.ico?v=20261114v" sizes="any">
+<link rel="apple-touch-icon" href="apple-touch-icon.png?v=20261114v">
+<link rel="stylesheet" href="style.css?v=20261114v">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand">
+      <h1>山海双策</h1>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="pool" role="tab">备选池</button>
+      <button class="tab" data-tab="strategy" role="tab">策略持仓</button>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ───────────────────────── 备选池 ───────────────────────── -->
+  <section class="panel is-active" id="panel-pool">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>备选池</h2>
+          <p class="muted" id="pool-summary">载入中…</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th><th>今日分时</th>
+              <th class="num">现价</th><th class="num">当日涨跌%</th><th class="num">成交额</th>
+              <th class="num">52 周新高</th><th class="num">120 日动量</th>
+              <th class="num">RAM 信号</th>
+            </tr>
+          </thead>
+          <tbody id="pool-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── 策略持仓 ───────────────────────── -->
+  <section class="panel" id="panel-strategy">
+    <div class="card hero">
+      <div class="card-head">
+        <div>
+          <h2>信号排名 Top 5</h2>
+          <p class="muted" id="strategy-asof">—</p>
+        </div>
+      </div>
+      <div class="seg-row">
+        <div class="seg" id="strategy-seg">
+          <button class="seg-btn" data-sid="high52">登峰HIGH</button>
+          <button class="seg-btn" data-sid="ram">致远RAM</button>
+        </div>
+        <button class="icon-btn" id="btn-run" aria-label="重新测算" data-tip="重新测算">
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor"
+               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 8a6 6 0 0 1 10.2-4.2L14 5.6"/>
+            <path d="M14 2v3.6h-3.6"/>
+            <path d="M14 8a6 6 0 0 1-10.2 4.2L2 10.4"/>
+            <path d="M2 14v-3.6h3.6"/>
+          </svg>
+        </button>
+      </div>
+      <div id="target-list" class="target-list"></div>
+      <div class="note" id="strategy-note">
+        <div>周一到周四不用看盘</div>
+        <div>信号日 14:45 点<b>刷新图标</b>（实时口径）</div>
+        <div>换手 &gt;20% 就 14:55 后换仓</div>
+        <div>收盘后点同一个按钮复核（日线口径）</div>
+        <div class="defense-text" id="defense-text">—</div>
+        <div id="pool-note"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>历史表现</h2>
+      <div class="legend" id="curve-legend"></div>
+      <div class="chart" id="curve"></div>
+      <div class="stats" id="backtest-stats"></div>
+      <table class="cmp">
+        <thead>
+          <tr><th>策略</th><th class="num">总收益</th><th class="num">年化</th><th class="num">夏普</th><th class="num">回撤</th></tr>
+        </thead>
+        <tbody id="compare-body"></tbody>
+      </table>
+      <p class="muted small">全收益口径已含成本 · 基准沪深300 不含股息<br>历史表现不代表未来。</p>
+    </div>
+
+    <div class="card">
+      <h2>换仓记录</h2>
+      <p class="muted" id="history-summary">—</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>日期</th><th>持仓</th></tr>
+          </thead>
+          <tbody id="history-list"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast" hidden></div>
+<script src="app.js?v=20261114v"></script>
+</body>
+</html>

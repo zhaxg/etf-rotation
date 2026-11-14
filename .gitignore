@@ -1,0 +1,15 @@
+# 生成物 / 运行时, 不入库
+__pycache__/
+*.py[cod]
+*.log
+web/cache/
+results/
+checks/
+
+# 研究用的旧口径数据 (18 只 QFQ 日线, 非线上依赖)
+data/
+
+# 本地环境
+.venv/
+venv/
+.DS_Store

@@ -1,0 +1,23 @@
+[
+ {
+  "market": 1,
+  "code": "512170",
+  "year": 2021,
+  "month": 2,
+  "day": 25,
+  "category": 11,
+  "name": "扩缩股",
+  "fenhong": 0.0,
+  "peigujia": 0.0,
+  "songzhuangu": 0.0,
+  "peigu": 0.0,
+  "suogu": 3.0,
+  "xingquanjia": 0.0,
+  "fenshu": 0.0,
+  "panqian_liutong": 0.0,
+  "qian_zongguben": 0.0,
+  "panhou_liutong": 0.0,
+  "hou_zongguben": 0.0,
+  "symbol": "sh512170"
+ }
+]
