@@ -6,7 +6,9 @@ web/cache/
 results/
 checks/
 
-# 研究用的旧口径数据 (18 只 QFQ 日线, 非线上依赖)
+# 运行时数据 (本地生成, 不入库): TR 全收益序列 / 原始价 / XDXR,
+# 以及研究用的旧口径数据 (18 只 QFQ 日线)
+data_tr/
 data/
 
 # 本地环境

@@ -22,8 +22,10 @@ strategies/        策略定义, 一个策略一个文件 (StrategySpec + 自动
 pipeline/          数据管线: 取不复权日线+XDXR → 重建 TR 序列
 research/          寻优 / 验证脚本 (一次性, 非线上依赖)
 web/               FastAPI: main.py 装配, core.py 计算, api/ 路由, static/ 前端
-data_tr/           TR 全收益序列 (线上数据源) + *_raw.csv 真实价 + *_xdxr.json 分红配股
 ```
+
+`data_tr/`（TR 全收益序列 + `*_raw.csv` 真实价 + `*_xdxr.json` 分红配股）是**本地运行时数据**，
+由 pipeline 生成、每日更新，不入库；`results/`、`checks/`、`web/cache/` 同为生成物，同样忽略。
 
 性能约定：回测结果落盘在 `web/cache/heavy.json`（不入库、可删、自动重建），
 缓存键 = 口径版本 + 池 + 策略参数 + 数据文件 mtime 指纹。
