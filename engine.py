@@ -1,7 +1,7 @@
 """ETF 轮动回测引擎。
 
 数据: data/{code}.csv (pytdxdata 前复权日线)。
-约定: 信号用 T 日收盘数据, T 日收盘成交, 收益从 T+1 日起计入;
+约定: 信号用 T 日收盘数据, 默认 T 日收盘成交, 也可改为下一交易日开盘成交;
      成本 = 单边换手 * cost_rate (默认 5bp/边, 买卖都计)。
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ SAFE = "511260"  # 十年国债ETF, 防守仓
 @dataclass
 class Market:
     close: pd.DataFrame
+    open: pd.DataFrame
     amount: pd.DataFrame
     ret: pd.DataFrame
     elig: pd.DataFrame
@@ -46,12 +47,22 @@ class Market:
 
 
 def load_market() -> Market:
-    close_frames, amount_frames = [], []
+    close_frames, open_frames, amount_frames = [], [], []
     for code in CODES:
         f = pd.read_csv(DATA_DIR / f"{code}.csv", parse_dates=["date"]).set_index("date").sort_index()
         close_frames.append(f["close"].rename(code))
+        # data_tr 的 close 是 TR 全收益指数, open 仍是不复权原始价; 必须按当日
+        # TR/原始 比例换算, 否则 open/close 两套标度混用会算出荒谬收益。
+        raw_path = DATA_DIR / f"{code}_raw.csv"
+        if raw_path.exists():
+            raw_close = (pd.read_csv(raw_path, parse_dates=["date"]).set_index("date")
+                         .sort_index()["close"].reindex(f.index).astype(float))
+            open_frames.append((f["open"].astype(float) * f["close"].astype(float) / raw_close).rename(code))
+        else:
+            open_frames.append(f["open"].rename(code))
         amount_frames.append(f["amount"].rename(code))
     close = pd.concat(close_frames, axis=1).sort_index()
+    opn = pd.concat(open_frames, axis=1).sort_index()
     amount = pd.concat(amount_frames, axis=1).sort_index()
     ret = close.pct_change()
 
@@ -72,7 +83,7 @@ def load_market() -> Market:
     blend = sum(ranks) / len(ranks)
 
     voladj = mom[60] / vol60.replace(0, np.nan)
-    return Market(close, amount, ret, elig, mom, vol60, ma, blend, voladj)
+    return Market(close, opn, amount, ret, elig, mom, vol60, ma, blend, voladj)
 
 
 # ---------------------------------------------------------------- 信号定义
@@ -121,8 +132,8 @@ class Result:
     weights: pd.DataFrame          # 各日实际持仓权重
     n_trades: int
     turnover: float                # 区间累计单边换手
-    holdings_log: list = field(default_factory=list)
-    trades_log: list = field(default_factory=list)  # (iso日期, 换手)
+    holdings_log: list = field(default_factory=list)  # (权重生效日, 持仓名)
+    trades_log: list = field(default_factory=list)    # (真实成交日, 换手)
 
 
 def simulate_rotation(
@@ -130,10 +141,20 @@ def simulate_rotation(
     buffer_rule: bool = False, cost: float = COST_RATE, name: str = "",
     buffer_mode: str | None = None, weight_mode: str = "equal",
     no_trade_band: float = 0.0, exec_lag: int = 0,
+    execution: str = "close",
+    signal_lag: int = 0,
     min_weight: float = 0.0,
     regime: pd.Series | None = None,
 ) -> Result:
-    """regime: 市场级防守开关 (布尔序列, 对齐交易日)。False → 无视信号, 全仓防守资产。"""
+    """regime: 市场级防守开关 (布尔序列, 对齐交易日)。False → 无视信号, 全仓防守资产。
+
+    signal_lag: 信号相对成交日再提前几个交易日。
+      - close + signal_lag=0: 周五收盘算信号、周五收盘成交 (同 bar, 实盘不可精确复制)
+      - close + signal_lag=1: 周四收盘算信号、周五收盘成交 (实盘可实现)
+      - next_open + signal_lag=0: 周五收盘算信号、周一开盘成交 (实盘可实现)
+    """
+    if execution not in {"close", "next_open"}:
+        raise ValueError(f"execution 必须是 close 或 next_open, 收到 {execution!r}")
     dates = mkt.close.index
     n = len(dates)
     codes = mkt.close.columns
@@ -159,6 +180,7 @@ def simulate_rotation(
     wmat = np.zeros((n, len(codes)))
     ret_arr = mkt.ret.fillna(0.0).to_numpy()
     cost_factor = np.ones(n)
+    override = np.full(n, np.nan)  # 单日组合收益覆盖 (next_open 成交日)
     holdings_log = []
     trades_log = []
     n_trades = 0
@@ -166,7 +188,7 @@ def simulate_rotation(
     prev_w = pd.Series(0.0, index=codes)
 
     for pos, di in enumerate(rebal_idx):
-        t = di - 1  # 信号日 = 上一交易日; 成交按该日收盘
+        t = di - 1 - signal_lag  # 信号日 = 成交日之前的第 signal_lag+1 个交易日
         if t < 250:
             continue
         tdate = dates[t]
@@ -214,22 +236,60 @@ def simulate_rotation(
         if turnover > max(no_trade_band, 1e-9):
             apply = min(di + exec_lag, n - 1)
             wmat[di:apply] = prev_w.to_numpy()  # 执行前维持旧仓
-            cost_factor[apply] = 1.0 - cost * turnover
+            if execution == "next_open":
+                close_px = mkt.close.iloc[apply].to_numpy(dtype=float)
+                open_px = mkt.open.iloc[apply].to_numpy(dtype=float)
+                prev_close_px = mkt.close.iloc[apply - 1].to_numpy(dtype=float) if apply > 0 else np.zeros(len(codes))
+                open_ok = np.isfinite(open_px) & (open_px > 0)
+                close_ok = np.isfinite(close_px) & (close_px > 0)
+                prev_ok = np.isfinite(prev_close_px) & (prev_close_px > 0)
+                overnight_ret = np.zeros(len(codes), dtype=float)
+                open_to_close_ret = np.zeros(len(codes), dtype=float)
+                both = close_ok & open_ok & prev_ok
+                overnight_ret[both] = open_px[both] / prev_close_px[both] - 1.0
+                open_to_close_ret[both] = close_px[both] / open_px[both] - 1.0
+                # 当日无开盘价 (停牌/数据缺失): 视为无法在该时点成交, 沿用收盘价口径
+                fallback = close_ok & ~open_ok & prev_ok
+                overnight_ret[fallback] = close_px[fallback] / prev_close_px[fallback] - 1.0
+                old_value = prev_w.to_numpy(dtype=float) * (1.0 + overnight_ret)
+                overnight_value = float(old_value.sum())
+                target_value = target.to_numpy(dtype=float) * max(overnight_value, 1e-12)
+                # 换手按开盘时的实际成交金额计 (双边 L1), 与单边 5bp 的收费口径一致
+                traded = float(np.abs(target_value - old_value).sum() / max(overnight_value, 1e-12))
+                cost_factor[apply] = 1.0 - cost * traded
+                # 当日收益 = 旧仓隔夜 (昨收→今开) + 新仓日内 (今开→今收),
+                # 无法用单一行权重表达, 单独覆盖
+                override[apply] = float(
+                    np.dot(prev_w.to_numpy(dtype=float), overnight_ret)
+                    + np.dot(target.to_numpy(dtype=float), open_to_close_ret)
+                )
+                turnover = traded
+            else:
+                cost_factor[apply] = 1.0 - cost * turnover
             turnover_total += turnover
             n_trades += 1
-            trades_log.append((dates[apply].date().isoformat(), turnover))
-            holdings_log.append((dates[apply].date().isoformat(), [NAME[c] for c in target_codes]))
+            # trades_log 记真实成交日 (收盘成交 = 生效日前一交易日收盘;
+            # 开盘成交 = 生效日当天开盘); holdings_log 记权重生效日, 便于
+            # 下游用 weights.loc[生效日] 直接取到新仓。
+            exec_di = apply - 1 if execution == "close" and apply > 0 else apply
+            trades_log.append((dates[exec_di].date().isoformat(), turnover))
+            # min_weight 可能砍掉小仓, 日志以最终非零权重为准
+            logged = [c for c in target_codes if target[c] > 0]
+            holdings_log.append((dates[apply].date().isoformat(), [NAME[c] for c in logged]))
             wmat[apply:end] = target.to_numpy()
             prev_w = target
         else:
             wmat[di:end] = prev_w.to_numpy()
 
     port_ret = (ret_arr * wmat).sum(axis=1)
+    filled = ~np.isnan(override)
+    port_ret[filled] = override[filled]
     growth = np.cumprod(1.0 + port_ret)
     equity = pd.Series(growth * np.cumprod(cost_factor), index=dates, name=name or f"{sig}_{filt}_k{top_k}_{freq}")
     weights = pd.DataFrame(wmat, index=dates, columns=codes)
     return Result(equity.name, {"sig": sig, "filt": filt, "top_k": top_k, "freq": freq,
-                                "buffer": buffer_mode, "weight": weight_mode, "cost": cost},
+                                "buffer": buffer_mode, "weight": weight_mode, "cost": cost,
+                                "execution": execution},
                   equity, weights, n_trades, turnover_total, holdings_log, trades_log)
 
 
