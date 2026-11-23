@@ -29,7 +29,7 @@ import pandas as pd
 
 import engine as E
 from pipeline import build_tr
-from pipeline.fetch_raw import ensure_data
+from pipeline.fetch_raw import ensure_data, fetch_bundle, write_bundle
 from strategies import STRATEGIES, fresh_target
 from universe import DEFAULT_CODES, WEB_POOL
 
@@ -57,11 +57,32 @@ def _save_names() -> None:
     NAMES_FILE.write_text(json.dumps(NAMES, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def _read_daily(code: str, kind: str = "raw") -> pd.DataFrame:
+    """读取日线并清洗；文件缺失 / 损坏 / 坏日期统一返回空表, 由调用方兜底。"""
+    path = DATA / (f"{code}_raw.csv" if kind == "raw" else f"{code}.csv")
+    try:
+        f = pd.read_csv(path, dtype={"date": str})
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return pd.DataFrame()
+    if "date" not in f.columns:
+        return pd.DataFrame()
+    f["date"] = pd.to_datetime(f["date"], errors="coerce", format="%Y-%m-%d")
+    f = f.dropna(subset=["date"])
+    for col in ("open", "high", "low", "close", "volume", "amount"):
+        if col in f.columns:
+            f[col] = pd.to_numeric(f[col], errors="coerce")
+    if "close" in f.columns:
+        f = f[f["close"].notna() & (f["close"] > 0)]
+    return f.sort_values("date").reset_index(drop=True)
+
+
 def default_entry(code: str) -> str:
     """原表口径: 指标可用 = 上市后约 6 个月; 不早于 2020-01。"""
     if code in ENTRY_DEFAULT:
         return ENTRY_DEFAULT[code]
-    f = pd.read_csv(DATA / f"{code}_raw.csv", parse_dates=["date"])
+    f = _read_daily(code)
+    if f.empty:
+        return "2020-01"
     start = f["date"].min() + pd.DateOffset(months=6)
     return max(start.strftime("%Y-%m"), "2020-01")
 
@@ -87,12 +108,31 @@ POOL_CODES: list[str] = _load_pool()
 INITIALIZING_DATA: bool = False
 
 
+def _bundle_ok(code: str) -> bool:
+    """raw / TR 都能解析出至少 2 根有效日线, 且 XDXR 文件存在。"""
+    return (len(_read_daily(code)) >= 2
+            and len(_read_daily(code, "tr")) >= 2
+            and (DATA / f"{code}_xdxr.json").exists())
+
+
+_data_check: dict = {"ts": 0.0, "missing": []}
+_DATA_CHECK_TTL = 30.0
+
+
+def _missing_bundles() -> list[str]:
+    """全池有效性检查较重 (30 只 × raw+TR), 30 秒内复用结果。"""
+    now = time.time()
+    if now - _data_check["ts"] < _DATA_CHECK_TTL:
+        return _data_check["missing"]
+    missing = [code for code in POOL_CODES if not _bundle_ok(code)]
+    _data_check.update(ts=now, missing=missing)
+    return missing
+
+
 async def ensure_initial_data() -> None:
-    """首次启动自动补齐本地日线 / XDXR / TR 数据；已有文件不会被重复拉取。"""
+    """首次启动自动补齐本地日线 / XDXR / TR 数据；已有且有效的文件不会重复拉取。"""
     global INITIALIZING_DATA
-    required = [code for code in POOL_CODES
-                if not (DATA / f"{code}_raw.csv").exists()
-                or not (DATA / f"{code}.csv").exists()]
+    required = _missing_bundles()
     if not required:
         return
     if INITIALIZING_DATA:
@@ -105,9 +145,7 @@ async def ensure_initial_data() -> None:
     finally:
         INITIALIZING_DATA = False
     if not ok:
-        missing = [code for code in required
-                   if not (DATA / f"{code}_raw.csv").exists()
-                   or not (DATA / f"{code}.csv").exists()]
+        missing = [code for code in required if not _bundle_ok(code)]
         raise HTTPException(503, f"行情数据初始化失败，缺少：{', '.join(missing)}")
 
 
@@ -119,14 +157,49 @@ _quote_cache: dict = {"ts": 0.0, "data": {}}
 _quote_lock = asyncio.Lock()
 
 
+def _valid_snapshot(sp) -> bool:
+    """行情源偶发返回垃圾字段 (日期越界 / 价格 0 / 负值), 先校验再使用。"""
+    try:
+        d = int(getattr(sp, "date", 0) or 0)
+        price = float(sp.close)
+        pre = float(sp.pre_close)
+        amount = float(getattr(sp, "amount", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if not (20000101 <= d <= 21001231):
+        return False
+    if not (math.isfinite(price) and price > 0 and math.isfinite(pre) and pre > 0):
+        return False
+    if not (math.isfinite(amount) and amount >= 0):
+        return False
+    return 0.5 <= price / pre <= 1.5
+
+
+def _valid_bar(b) -> bool:
+    try:
+        price = float(b.price)
+        d = int(b.date)
+        h = int(b.hour)
+        m = int(b.minute)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return (math.isfinite(price) and price > 0 and 20000101 <= d <= 21001231
+            and 0 <= h <= 23 and 0 <= m <= 59)
+
+
 def _fallback_quote(code: str) -> dict:
-    """分时接口不可用时退化为日线快照。"""
-    f = pd.read_csv(DATA / f"{code}_raw.csv", parse_dates=["date"]).set_index("date")
+    """分时接口不可用时退化为日线快照；无可用日线时返回空行情, 不抛错。"""
+    f = _read_daily(code)
+    if f.empty:
+        return {"price": 0.0, "change_pct": 0.0, "amount": 0.0, "spark": [],
+                "pre": 0.0, "day": ""}
     close = float(f["close"].iloc[-1])
     prev = float(f["close"].iloc[-2]) if len(f) > 1 else close
+    amount = float(f["amount"].iloc[-1]) if "amount" in f else 0.0
     return {"price": close, "change_pct": (close / prev - 1) if prev else 0.0,
-            "amount": float(f["amount"].iloc[-1]), "spark": [], "pre": round(prev, 4),
-            "day": f.index[-1].date().isoformat()}
+            "amount": amount if pd.notna(amount) else 0.0,
+            "spark": [], "pre": round(prev, 4),
+            "day": f["date"].iloc[-1].date().isoformat()}
 
 
 async def load_quotes(force: bool = False) -> dict:
@@ -159,10 +232,29 @@ async def _fetch_quotes() -> dict:
             groups: dict[int, list[str]] = {}
             for sym in symbols:
                 sp = snap_by.get(sym)
-                ymd = int(getattr(sp, "date", 0) or 0) if sp is not None else 0
+                ymd = int(sp.date) if sp is not None and _valid_snapshot(sp) else 0
                 groups.setdefault(ymd, []).append(sym)
             for ymd, syms in groups.items():
-                minutes += await d.get_minutes(syms, date=ymd or None)
+                try:
+                    minutes += await d.get_minutes(syms, date=ymd or None)
+                except Exception:
+                    pass  # 单组失败不拖垮其余标的
+            # 行情源偶发只返回部分标的: 对没有分时的标的补抓两次
+            for _ in range(2):
+                got = {b.symbol for b in minutes if _valid_bar(b)}
+                missing = [s for s in symbols if s not in got]
+                if not missing:
+                    break
+                by_date: dict[int, list[str]] = {}
+                for sym in missing:
+                    sp = snap_by.get(sym)
+                    ymd = int(sp.date) if sp is not None and _valid_snapshot(sp) else 0
+                    by_date.setdefault(ymd, []).append(sym)
+                for ymd, syms in by_date.items():
+                    try:
+                        minutes += await d.get_minutes(syms, date=ymd or None)
+                    except Exception:
+                        pass
     except Exception:
         pass
     snap_by = {s.symbol: s for s in snaps}
@@ -175,14 +267,15 @@ async def _fetch_quotes() -> dict:
         q = _fallback_quote(code)
         sp = snap_by.get(sym)
         pre = 0.0
-        if sp is not None and getattr(sp, "pre_close", 0):
+        if sp is not None and _valid_snapshot(sp):
             pre = float(sp.pre_close)
             q["price"] = float(sp.close)
             q["change_pct"] = (float(sp.close) / pre - 1) if pre else 0.0
             q["amount"] = float(getattr(sp, "amount", 0) or 0)
         if not pre:
             pre = q["price"] / (1 + q["change_pct"]) if q["change_pct"] != -1 else q["price"]
-        bars = sorted(bars_by.get(sym, []), key=lambda b: (b.date, b.hour, b.minute))
+        bars = sorted((b for b in bars_by.get(sym, []) if _valid_bar(b)),
+                      key=lambda b: (b.date, b.hour, b.minute))
         if bars and pre > 0:
             latest = max(b.date for b in bars)
             pts = [float(b.price) for b in bars if b.date == latest]
@@ -190,10 +283,11 @@ async def _fetch_quotes() -> dict:
             q["spark"] = [round(pts[i], 4) for i in range(0, len(pts), step)]
         q["pre"] = round(pre, 4) if pre else 0.0
         # 行情所属交易日 (非交易时间 = 最近交易日): 现价/涨跌/成交额/分时同属这一天
-        ymd = int(getattr(sp, "date", 0) or 0) if sp is not None else 0
+        ymd = int(sp.date) if sp is not None and _valid_snapshot(sp) else 0
         if not ymd and bars:
             ymd = int(max(b.date for b in bars))
-        q["day"] = (f"{ymd // 10000:04d}-{ymd // 100 % 100:02d}-{ymd % 100:02d}" if ymd else "")
+        if ymd:  # 无有效实时行情时保留日线兜底的 day
+            q["day"] = f"{ymd // 10000:04d}-{ymd // 100 % 100:02d}-{ymd % 100:02d}"
         out[code] = q
     _quote_cache.update(ts=time.time(), data=out)
     return out
@@ -206,8 +300,8 @@ _price_cache: dict[str, float] = {}
 
 def latest_price(code: str) -> float:
     if code not in _price_cache:
-        f = pd.read_csv(DATA / f"{code}_raw.csv", parse_dates=["date"]).set_index("date")
-        _price_cache[code] = float(f["close"].iloc[-1])
+        f = _read_daily(code)
+        _price_cache[code] = float(f["close"].iloc[-1]) if not f.empty else 0.0
     return _price_cache[code]
 
 
@@ -221,7 +315,8 @@ def futunn_link(code: str) -> str:
 def code_stats(code: str) -> dict:
     """两个策略的决策量 (与引擎同口径): high52 = 收盘/250日最高 (52周新高接近度),
     ram30 = 30日动量/20日波动率, mom120 = 120日动量 (abs120 过滤门限)。"""
-    tr = pd.read_csv(DATA / f"{code}.csv", parse_dates=["date"]).set_index("date")["close"].astype(float)
+    f = _read_daily(code, "tr")
+    tr = f.set_index("date")["close"].astype(float) if not f.empty else pd.Series(dtype=float)
     ret = tr.pct_change().dropna()
     high52 = float(tr.iloc[-1] / tr.tail(250).max()) if len(tr) >= 60 else float("nan")
     mom120 = float(tr.iloc[-1] / tr.iloc[-121] - 1) if len(tr) > 120 else float("nan")
@@ -351,29 +446,23 @@ _refresh_state: dict = {"running": False, "ts": 0.0, "checked": 0.0, "task": Non
 
 
 async def _pull_history(code: str) -> bool:
-    """取一只标的的日线+XDXR → raw/xdxr 落盘并重建 TR。网络 I/O 在锁外, 落盘全程在锁内。"""
+    """取一只标的的日线+XDXR → 校验/合并后落盘并重建 TR。
+
+    网络 I/O 在锁外, 落盘全程在锁内; 抓取数据不合法时直接抛错,
+    调用方保留旧文件, 绝不用坏数据覆盖。
+    """
     from pytdxdata import TdxData
-    from pytdxdata.models import KlinePeriod, Adjust
     symbol = ("sh" if code.startswith(("5", "6")) else "sz") + code
     async with TdxData() as d:
-        rows = await d.get_bars(symbol, KlinePeriod.DAY, start=0, count=5000, adjust=Adjust.NONE)
-        xdxr = await d.get_xdxr(symbol)
-        snaps = await d.get_snapshot([symbol])
-    if not rows:
-        return False
-    recs = [{"date": f"{r.year:04d}-{r.month:02d}-{r.day:02d}", "open": r.open,
-             "high": r.high, "low": r.low, "close": r.close,
-             "volume": r.vol, "amount": r.amount} for r in rows]
+        merged, events = await fetch_bundle(d, code)
+        try:
+            snaps = await d.get_snapshot([symbol])
+        except Exception:
+            snaps = []
     with LOCK:  # 落盘段全程无 await, 不会与回测计算互相卡死
-        with (DATA / f"{code}_raw.csv").open("w", newline="") as h:
-            w = csv.DictWriter(h, fieldnames=list(recs[0].keys()))
-            w.writeheader()
-            w.writerows(recs)
-        (DATA / f"{code}_xdxr.json").write_text(
-            json.dumps([dataclasses.asdict(x) for x in xdxr], ensure_ascii=False, indent=1),
-            encoding="utf-8")
-        build_tr.build(code)
+        write_bundle(code, merged, events)
         _price_cache.pop(code, None)
+        _data_check["ts"] = 0.0
     if snaps and getattr(snaps[0], "name", None) and NAMES.get(code, code) == code:
         NAMES[code] = snaps[0].name
         _save_names()
@@ -381,17 +470,16 @@ async def _pull_history(code: str) -> bool:
 
 
 def _data_stale(codes: list[str]) -> list[str]:
-    """日线缺数超过 1 个自然日的标的 (今日的价由实时测算补, 不算缺)。"""
+    """日线缺数超过 1 个自然日、或文件损坏无法解析的标的。"""
     today = pd.Timestamp(date.today())
     stale = []
     for c in codes:
-        try:
-            last = pd.read_csv(DATA / f"{c}_raw.csv", usecols=["date"],
-                               parse_dates=["date"])["date"].max()
-        except Exception:
+        f = _read_daily(c)
+        if f.empty:
             stale.append(c)
             continue
-        if (today - last).days > 1:
+        last = f["date"].max()
+        if pd.isna(last) or (today - last).days > 1:
             stale.append(c)
     return stale
 
@@ -403,6 +491,7 @@ async def _refresh_stale(stale: list[str]) -> None:
         except Exception:
             pass  # 个别失败不打断, 冷却后下次重试
     _quote_cache["ts"] = 0.0
+    _data_check["ts"] = 0.0
     _refresh_state.update(running=False, ts=time.time())
 
 
@@ -435,7 +524,9 @@ async def live_hs300_status(ma: int = 60) -> dict:
             async with TdxData() as d:
                 snaps = await d.get_snapshot(["sh000300"])
             if snaps:
-                live = float(snaps[0].close)
+                cand = float(snaps[0].close)
+                if math.isfinite(cand) and 500 < cand < 50000:
+                    live = cand
         except Exception:
             live = None
     if live is None:

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -18,8 +20,9 @@ DATA_TR = ROOT / "data_tr"
 QFQ_DIRS = [ROOT / "data"]  # 早前取的 QFQ, 用于验证
 
 
-def load_events(code: str) -> pd.DataFrame:
-    evs = json.loads((DATA_TR / f"{code}_xdxr.json").read_text(encoding="utf-8"))
+def load_events(code: str, data_dir: Path | None = None) -> pd.DataFrame:
+    base = Path(data_dir) if data_dir is not None else DATA_TR
+    evs = json.loads((base / f"{code}_xdxr.json").read_text(encoding="utf-8"))
     rows = []
     for e in evs:
         if e["category"] == 1:
@@ -38,10 +41,20 @@ def load_events(code: str) -> pd.DataFrame:
     return out
 
 
-def build(code: str) -> dict:
-    raw = pd.read_csv(DATA_TR / f"{code}_raw.csv", parse_dates=["date"]).set_index("date").sort_index()
+def build(code: str, data_dir: Path | None = None) -> dict:
+    base = Path(data_dir) if data_dir is not None else DATA_TR
+    raw = pd.read_csv(base / f"{code}_raw.csv", dtype={"date": str})
+    if "date" not in raw.columns:
+        raise ValueError(f"{code}: raw 缺少 date 列")
+    raw["date"] = pd.to_datetime(raw["date"], errors="coerce", format="%Y-%m-%d")
+    raw["close"] = pd.to_numeric(raw["close"], errors="coerce")
+    raw = raw.dropna(subset=["date"])
+    raw = raw[raw["close"] > 0]
+    if len(raw) < 2:
+        raise ValueError(f"{code}: 有效日线不足 2 行, 拒绝重建 TR")
+    raw = raw.set_index("date").sort_index()
     P = raw["close"].astype(float)
-    ev = load_events(code)
+    ev = load_events(code, base)
 
     # 事件日 -> 交易日映射 (取 >= 事件日的首个交易日)
     ev_on: dict[pd.Timestamp, dict] = {}
@@ -103,7 +116,18 @@ def build(code: str) -> dict:
 
     out = raw.copy()
     out["close"] = pd.Series(tr, index=dates) * 100.0  # TR 指数, 标度无关紧要
-    out.reset_index().to_csv(DATA_TR / f"{code}.csv", index=False)
+    target = base / f"{code}.csv"
+    fd, tmp = tempfile.mkstemp(dir=str(base), prefix=f".{code}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as h:
+            out.reset_index().to_csv(h, index=False)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return {"code": code, "bars": n, "events": len(ev_on), "qfq_max_dev": dev}
 
 
