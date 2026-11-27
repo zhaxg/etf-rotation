@@ -9,7 +9,6 @@ HTTP 路由见 web/api/*.py, 应用装配见 web/main.py。
 """
 from __future__ import annotations
 
-import csv
 import dataclasses
 import json
 import math
@@ -29,7 +28,9 @@ import pandas as pd
 
 import engine as E
 from pipeline import build_tr
-from pipeline.fetch_raw import ensure_data, fetch_bundle, write_bundle
+from pipeline.fetch_raw import (ensure_data, fetch_bundle, write_bundle,
+                                rows_to_records, validate_records, _load_existing,
+                                merge_records, write_csv_atomic)
 from strategies import STRATEGIES, fresh_target
 from universe import DEFAULT_CODES, WEB_POOL
 
@@ -344,39 +345,66 @@ SAFE_CODES = sorted({spec.safe for spec in STRATEGIES.values()})  # 防守仓始
 INDEX_FILE = DATA / "000300_raw.csv"
 
 
-async def ensure_index() -> None:
-    """沪深300 指数日线: 本地文件 1 天内不重拉 (按文件 mtime 判断, 重启也不重拉);
-    拉取失败沿用本地缓存。"""
+_INDEX_STATE = {"failed_ts": 0.0, "cooldown": 1800}  # 抓取失败冷却, 避免每个请求都等超时
+
+
+def _read_index_frame() -> pd.DataFrame:
+    """读取沪深300 日线; 坏日期/坏价格行直接丢弃, 有效行不足时抛错。"""
+    if not INDEX_FILE.exists():
+        raise ValueError("沪深300 日线文件不存在")
+    f = pd.read_csv(INDEX_FILE, dtype={"date": str})
+    if "date" not in f.columns or "close" not in f.columns:
+        raise ValueError("沪深300 日线缺少 date/close 列")
+    f["date"] = pd.to_datetime(f["date"], errors="coerce", format="%Y-%m-%d")
+    f["close"] = pd.to_numeric(f["close"], errors="coerce")
+    f = f.dropna(subset=["date", "close"])
+    f = f[f["close"] > 0].drop_duplicates("date").sort_values("date")
+    if len(f) < 2:
+        raise ValueError(f"沪深300 日线有效行只有 {len(f)} 行")
+    return f.set_index("date")
+
+
+async def ensure_index(force: bool = False) -> bool:
+    """沪深300 指数日线: 本地文件 1 天内不重拉 (按文件 mtime 判断, 重启也不重拉)。
+
+    抓取结果必须校验通过、且与本地历史合并后不能变旧, 才会原子落盘;
+    上游偶发返回 `0000-00-00` 单行垃圾时保留原有可用文件。
+    """
     now = time.time()
-    if INDEX_FILE.exists() and now - INDEX_FILE.stat().st_mtime < 86400:
-        return
+    if not force and INDEX_FILE.exists() and now - INDEX_FILE.stat().st_mtime < 86400:
+        return True
+    if not force and now - _INDEX_STATE["failed_ts"] < _INDEX_STATE["cooldown"]:
+        return False
     try:
         from pytdxdata import TdxData
         from pytdxdata.models import KlinePeriod, Adjust
         async with TdxData() as d:
-            rows = await d.get_bars("sh000300", KlinePeriod.DAY, start=0, count=2000, adjust=Adjust.NONE)
-        if rows:
-            recs = [{"date": f"{r.year:04d}-{r.month:02d}-{r.day:02d}", "open": r.open,
-                     "high": r.high, "low": r.low, "close": r.close,
-                     "volume": r.vol, "amount": r.amount} for r in rows]
-            with INDEX_FILE.open("w", newline="") as h:
-                w = csv.DictWriter(h, fieldnames=list(recs[0].keys()))
-                w.writeheader()
-                w.writerows(recs)
-    except Exception:
-        pass  # 沿用缓存
+            rows = await d.get_bars("sh000300", KlinePeriod.DAY, start=0, count=2000,
+                                    adjust=Adjust.NONE)
+        fresh = rows_to_records(rows)
+        validate_records(fresh, min_rows=100)  # 指数历史至少上百行, 单行响应一律拒绝
+        existing = _load_existing(INDEX_FILE)
+        merged = merge_records(existing, fresh)
+        old_last = existing[-1]["date"] if existing else ""
+        if not merged or merged[-1]["date"] < old_last:
+            raise ValueError(f"合并后反而变旧: {old_last} → {merged[-1]['date'] if merged else '空'}")
+        write_csv_atomic(INDEX_FILE, merged)
+        _INDEX_STATE["failed_ts"] = 0.0
+        return True
+    except Exception as exc:
+        _INDEX_STATE["failed_ts"] = time.time()
+        print(f"沪深300 日线刷新失败, 沿用本地缓存: {type(exc).__name__}: {exc}")
+        return False
 
 
 def hs300_regime(index: pd.DatetimeIndex, ma: int = 60) -> pd.Series:
     """True = 沪深300 在均线之上 (进攻); False = 跌破均线 (切防御腿)。"""
-    f = pd.read_csv(INDEX_FILE, parse_dates=["date"]).set_index("date")
-    close = f["close"].astype(float)
+    close = _read_index_frame()["close"].astype(float)
     return (close > close.rolling(ma).mean()).reindex(index).ffill().fillna(False).astype(bool)
 
 
 def hs300_status(ma: int = 60) -> dict:
-    f = pd.read_csv(INDEX_FILE, parse_dates=["date"]).set_index("date")
-    close = f["close"].astype(float)
+    close = _read_index_frame()["close"].astype(float)
     line = float(close.rolling(ma).mean().iloc[-1])
     last = float(close.iloc[-1])
     return {"close": round(last, 2), "ma": round(line, 2),
@@ -389,7 +417,10 @@ def hs300_status(ma: int = 60) -> dict:
 def _new_session_day(last_date: pd.Timestamp) -> bool:
     """快照价是否代表一根新日线: 工作日 09:15 后 (盘中/收盘后) 且文件尚未含今日。"""
     today = pd.Timestamp(date.today())
-    return bool(today > last_date and today.weekday() < 5
+    last = pd.Timestamp(last_date)
+    if pd.isna(last):
+        return bool(today.weekday() < 5 and datetime.now().time() >= dtime(9, 15))
+    return bool(today > last and today.weekday() < 5
                 and datetime.now().time() >= dtime(9, 15))
 
 
@@ -515,8 +546,7 @@ def maybe_refresh_data() -> None:
 
 async def live_hs300_status(ma: int = 60) -> dict:
     """实时口径 HS300 vs MA60 (快照价补上今日; 停市时段退回文件口径)。"""
-    f = pd.read_csv(INDEX_FILE, parse_dates=["date"]).set_index("date")
-    close = f["close"].astype(float)
+    close = _read_index_frame()["close"].astype(float)
     live = None
     if _new_session_day(close.index[-1]):
         try:
@@ -631,7 +661,7 @@ def _backtest(mkt: E.Market, reg: pd.Series, defense: bool) -> dict:
                     "prev": {c: float(v) for c, v in prev.items() if v > 0}}
 
     # 沪深300 基准 (价格指数, 指标与策略同口径)
-    idx = pd.read_csv(INDEX_FILE, parse_dates=["date"]).set_index("date")["close"].astype(float)
+    idx = _read_index_frame()["close"].astype(float)
     idx = idx.loc[E.BACKTEST_START:].dropna()
     bm_m = E.metrics(idx)
     idx = idx / float(idx.iloc[0])
@@ -770,7 +800,10 @@ async def run_strategy(pool: list[dict], defense: bool = False, live: bool | Non
         use_live = any((q or {}).get("day") == today_s for q in quotes.values())
     else:
         use_live = bool(live)
-    hs = await live_hs300_status() if use_live else hs300_status()
+    try:
+        hs = await live_hs300_status() if use_live else hs300_status()
+    except ValueError as exc:  # 指数文件损坏且短期补抓失败: 明确报错, 不静默降级
+        raise HTTPException(503, f"沪深300 数据不可用：{exc}") from exc
 
     key = _calc_key(codes, entry, defense)
     with LOCK:
